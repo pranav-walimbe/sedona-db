@@ -5670,6 +5670,7 @@ dependencies = [
  "datafusion",
  "futures",
  "sedona",
+ "sedona-extension",
  "tokio",
 ]
 
@@ -5758,13 +5759,24 @@ version = "0.4.0"
 dependencies = [
  "arrow-array",
  "arrow-schema",
+ "async-trait",
+ "datafusion",
+ "datafusion-catalog",
  "datafusion-common",
+ "datafusion-execution",
  "datafusion-expr",
+ "datafusion-physical-expr",
+ "datafusion-physical-plan",
+ "futures",
  "libc",
  "sedona-common",
  "sedona-expr",
  "sedona-schema",
  "sedona-testing",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-stream",
 ]
 
 [[package]]
@@ -6382,6 +6394,7 @@ dependencies = [
  "sedona-adbc",
  "sedona-datasource",
  "sedona-expr",
+ "sedona-extension",
  "sedona-gdal",
  "sedona-geometry",
  "sedona-geoparquet",
@@ -6425,6 +6438,7 @@ dependencies = [
  "sedona",
  "sedona-adbc",
  "sedona-expr",
+ "sedona-extension",
  "sedona-geometry",
  "sedona-geoparquet",
  "sedona-proj",
@@ -7002,6 +7016,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1729aa945f29d91ba541258c8df89027d5792d85a8841fb65e8bf0f4ede4ef61"
 dependencies = [
  "rustls",
+ "tokio",
+]
+
+[[package]]
+name = "tokio-stream"
+version = "0.1.18"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "32da49809aab5c3bc678af03902d4ccddea2a87d028d86392a4b1560c6906c70"
+dependencies = [
+ "futures-core",
+ "pin-project-lite",
  "tokio",
 ]
 
