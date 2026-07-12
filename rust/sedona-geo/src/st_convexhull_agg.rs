@@ -137,7 +137,7 @@ fn hull_wkb_size(vertices: &[Coord]) -> usize {
         0 => 9,
         1 => 21,
         2 => 41,
-        n => 5 + 4 + 4 + n * 16,
+        n => 13 + n * 16,
     }
 }
 
