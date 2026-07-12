@@ -168,6 +168,32 @@ def test_st_envelope_nontrivial_input(eng, geoarrow_data):
     geopandas.testing.assert_geodataframe_equal(df, expected, check_crs=False)
 
 
+@pytest.mark.parametrize("eng", [SedonaDB])
+def test_st_convexhull_agg_matches_collect_chain(eng, con):
+    eng = eng.create_or_skip()
+    num_groups = 100
+
+    df_points = con.sql("""
+        SELECT id, geometry FROM sd_random_geometry(
+            '{"geom_type": "Point", "num_rows": 2000, "seed": 9728}'
+        )
+    """)
+    eng.create_table_arrow("df_points", df_points.to_arrow_table())
+
+    eng.assert_query_result(
+        f"""
+        SELECT bool_and(ST_Equals(hull_new, hull_old)) FROM (
+            SELECT
+                ST_ConvexHull_Agg(geometry) AS hull_new,
+                ST_ConvexHull(ST_Collect_Agg(geometry)) AS hull_old
+            FROM df_points
+            GROUP BY id % {num_groups}
+        )
+        """,
+        True,
+    )
+
+
 @pytest.mark.parametrize("eng", [SedonaDB, PostGIS])
 def test_st_collect_points(eng):
     eng = eng.create_or_skip()

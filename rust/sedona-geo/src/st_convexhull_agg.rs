@@ -17,14 +17,10 @@
 
 use std::sync::Arc;
 
-use arrow_array::builder::{BinaryBuilder, Int32Builder};
+use arrow_array::builder::BinaryBuilder;
 use arrow_array::{Array, ArrayRef, BooleanArray};
-use arrow_schema::{DataType, Field, FieldRef};
-use datafusion_common::{
-    cast::{as_binary_array, as_int32_array},
-    error::Result,
-    exec_err, DataFusionError, ScalarValue,
-};
+use arrow_schema::FieldRef;
+use datafusion_common::{cast::as_binary_array, error::Result, DataFusionError, ScalarValue};
 use datafusion_expr::{Accumulator, ColumnarValue, EmitTo, GroupsAccumulator};
 use geo::{algorithm::convex_hull::quick_hull, Coord};
 use geo_traits::{Dimensions, GeometryTrait};
@@ -37,7 +33,6 @@ use sedona_functions::executor::WkbExecutor;
 use sedona_geometry::bounds::visit_xy_coords;
 use sedona_geometry::wkb_factory::{
     write_wkb_geometrycollection_header, write_wkb_linestring, write_wkb_point, write_wkb_polygon,
-    WKB_MIN_PROBABLE_BYTES,
 };
 use sedona_schema::{
     datatypes::{SedonaType, WKB_GEOMETRY},
@@ -80,48 +75,13 @@ impl SedonaAccumulator for STConvexHullAgg {
     }
 
     fn state_fields(&self, _args: &[SedonaType]) -> Result<Vec<FieldRef>> {
-        Ok(vec![
-            Arc::new(WKB_GEOMETRY.to_storage_field("hull", true)?),
-            Arc::new(Field::new("dimension", DataType::Int32, true)),
-        ])
+        Ok(vec![Arc::new(WKB_GEOMETRY.to_storage_field("hull", true)?)])
     }
 }
 
 fn push_hull_coords(geom: impl GeometryTrait<T = f64>, out: &mut Vec<Coord>) -> Result<()> {
     visit_xy_coords(geom, false, &mut |x, y| out.push((x, y).into()))
         .map_err(|e| DataFusionError::Execution(format!("ST_ConvexHull_Agg(): {e}")))
-}
-
-fn dimension_code(dimensions: Dimensions) -> i32 {
-    match dimensions {
-        Dimensions::Xy => 0,
-        Dimensions::Xyz => 1,
-        Dimensions::Xym => 2,
-        Dimensions::Xyzm => 3,
-        Dimensions::Unknown(_) => 4,
-    }
-}
-
-fn observe_dimension(state: &mut Option<i32>, code: i32) {
-    // Some(-1) is a sentinel meaning mixed dimensions were observed
-    *state = match *state {
-        Some(seen) if seen != code => Some(-1),
-        _ => Some(code),
-    };
-}
-
-fn merge_dimension(state: &mut Option<i32>, other: Option<i32>) {
-    if let Some(code) = other {
-        observe_dimension(state, code);
-    }
-}
-
-fn check_dimension(state: Option<i32>) -> Result<()> {
-    if state == Some(-1) {
-        exec_err!("Can't ST_ConvexHull_Agg() mixed dimension geometries")
-    } else {
-        Ok(())
-    }
 }
 
 fn filter_keep(filter: Option<&BooleanArray>, i: usize) -> bool {
@@ -142,22 +102,20 @@ fn coord_cmp(a: &Coord, b: &Coord) -> std::cmp::Ordering {
         .then(normalize_zero(a.x).total_cmp(&normalize_zero(b.x)))
 }
 
-fn write_hull(coords: &mut [Coord], writer: &mut impl std::io::Write) -> Result<()> {
+fn compute_hull_vertices(coords: &mut [Coord]) -> Vec<Coord> {
     if coords.is_empty() {
-        return write_wkb_geometrycollection_header(writer, Dimensions::Xy, 0)
-            .map_err(|e| DataFusionError::Execution(format!("Failed to write header: {e}")));
+        return Vec::new();
     }
 
-    // geo 0.31's quick_hull always returns a closed ring (both the trivial_hull and qhull paths call .close())
+    // geo 0.31's quick_hull always returns a closed ring
     let mut vertices = quick_hull(coords).0;
     vertices.pop();
 
     match vertices.len() {
-        0 => write_wkb_geometrycollection_header(writer, Dimensions::Xy, 0),
-        1 => write_wkb_point(writer, (vertices[0].x, vertices[0].y)),
+        0 | 1 => vertices,
         2 => {
             vertices.sort_unstable_by(coord_cmp);
-            write_wkb_linestring(writer, vertices.iter().map(|c| (c.x, c.y)))
+            vertices
         }
         _ => {
             vertices.reverse();
@@ -169,10 +127,32 @@ fn write_hull(coords: &mut [Coord], writer: &mut impl std::io::Write) -> Result<
                 .unwrap();
             vertices.rotate_left(start);
             vertices.push(vertices[0]);
-            write_wkb_polygon(writer, vertices.iter().map(|c| (c.x, c.y)))
+            vertices
         }
     }
+}
+
+fn hull_wkb_size(vertices: &[Coord]) -> usize {
+    match vertices.len() {
+        0 => 9,
+        1 => 21,
+        2 => 41,
+        n => 13 + n * 16,
+    }
+}
+
+fn write_hull_vertices(vertices: &[Coord], writer: &mut impl std::io::Write) -> Result<()> {
+    match vertices.len() {
+        0 => write_wkb_geometrycollection_header(writer, Dimensions::Xy, 0),
+        1 => write_wkb_point(writer, (vertices[0].x, vertices[0].y)),
+        2 => write_wkb_linestring(writer, vertices.iter().map(|c| (c.x, c.y))),
+        _ => write_wkb_polygon(writer, vertices.iter().map(|c| (c.x, c.y))),
+    }
     .map_err(|e| DataFusionError::Execution(format!("Failed to write hull: {e}")))
+}
+
+fn write_hull(coords: &mut [Coord], writer: &mut impl std::io::Write) -> Result<()> {
+    write_hull_vertices(&compute_hull_vertices(coords), writer)
 }
 
 fn push_state_coords(hulls: &dyn Array, index: usize, out: &mut Vec<Coord>) -> Result<bool> {
@@ -192,7 +172,6 @@ struct ConvexHullAccumulator {
     input_type: SedonaType,
     coords: Vec<Coord>,
     has_input: bool,
-    dimension: Option<i32>,
 }
 
 impl ConvexHullAccumulator {
@@ -201,7 +180,6 @@ impl ConvexHullAccumulator {
             input_type,
             coords: Vec::new(),
             has_input: false,
-            dimension: None,
         }
     }
 
@@ -210,7 +188,6 @@ impl ConvexHullAccumulator {
             return Ok(None);
         }
 
-        check_dimension(self.dimension)?;
         let mut wkb = Vec::new();
         write_hull(&mut self.coords, &mut wkb)?;
         Ok(Some(wkb))
@@ -229,7 +206,6 @@ impl Accumulator for ConvexHullAccumulator {
         executor.execute_wkb_void(|maybe_item| {
             if let Some(item) = maybe_item {
                 self.has_input = true;
-                observe_dimension(&mut self.dimension, dimension_code(item.dim()));
                 push_hull_coords(&item, &mut self.coords)?;
             }
             Ok(())
@@ -243,10 +219,7 @@ impl Accumulator for ConvexHullAccumulator {
     }
 
     fn state(&mut self) -> Result<Vec<ScalarValue>> {
-        Ok(vec![
-            ScalarValue::Binary(self.make_wkb_result()?),
-            ScalarValue::Int32(self.dimension),
-        ])
+        Ok(vec![ScalarValue::Binary(self.make_wkb_result()?)])
     }
 
     fn size(&self) -> usize {
@@ -254,20 +227,15 @@ impl Accumulator for ConvexHullAccumulator {
     }
 
     fn merge_batch(&mut self, states: &[ArrayRef]) -> Result<()> {
-        if states.len() != 2 {
+        if states.len() != 1 {
             return sedona_internal_err!(
-                "Unexpected number of state fields for st_convexhull_agg() (expected 2, got {})",
+                "Unexpected number of state fields for st_convexhull_agg() (expected 1, got {})",
                 states.len()
             );
         }
 
-        let dimensions = as_int32_array(&states[1])?;
         for i in 0..states[0].len() {
             self.has_input |= push_state_coords(&states[0], i, &mut self.coords)?;
-            merge_dimension(
-                &mut self.dimension,
-                (!dimensions.is_null(i)).then(|| dimensions.value(i)),
-            );
         }
 
         Ok(())
@@ -279,7 +247,6 @@ struct ConvexHullGroupsAccumulator {
     input_type: SedonaType,
     coords: Vec<Vec<Coord>>,
     has_input: Vec<bool>,
-    dimensions: Vec<Option<i32>>,
 }
 
 impl ConvexHullGroupsAccumulator {
@@ -288,7 +255,6 @@ impl ConvexHullGroupsAccumulator {
             input_type,
             coords: Vec::new(),
             has_input: Vec::new(),
-            dimensions: Vec::new(),
         }
     }
 
@@ -311,7 +277,6 @@ impl ConvexHullGroupsAccumulator {
         let executor = WkbExecutor::new(&arg_types, &args);
         self.coords.resize_with(total_num_groups, Default::default);
         self.has_input.resize(total_num_groups, false);
-        self.dimensions.resize(total_num_groups, None);
         let mut i = 0;
 
         executor.execute_wkb_void(|maybe_item| {
@@ -322,7 +287,6 @@ impl ConvexHullGroupsAccumulator {
             if keep {
                 if let Some(item) = maybe_item {
                     self.has_input[group_id] = true;
-                    observe_dimension(&mut self.dimensions[group_id], dimension_code(item.dim()));
                     push_hull_coords(&item, &mut self.coords[group_id])?;
                 }
             }
@@ -333,38 +297,40 @@ impl ConvexHullGroupsAccumulator {
         Ok(())
     }
 
-    fn emit_wkb_result(&mut self, emit_to: EmitTo) -> Result<(ArrayRef, ArrayRef)> {
+    fn emit_wkb_result(&mut self, emit_to: EmitTo) -> Result<ArrayRef> {
         let emit_size = match emit_to {
             EmitTo::All => self.coords.len(),
             EmitTo::First(n) => n,
         };
 
-        let mut hull_builder =
-            BinaryBuilder::with_capacity(emit_size, emit_size * WKB_MIN_PROBABLE_BYTES);
-        let mut dimension_builder = Int32Builder::with_capacity(emit_size);
-
         // Draining keeps indices in lockstep with DataFusion's post-emit group renumbering
         let emitted_coords = self.coords.drain(0..emit_size);
         let emitted_has_input = self.has_input.drain(0..emit_size);
-        let emitted_dimensions = self.dimensions.drain(0..emit_size);
-        for ((mut group_coords, has_input), dimension) in emitted_coords
-            .zip(emitted_has_input)
-            .zip(emitted_dimensions)
-        {
+
+        let mut hulls = Vec::with_capacity(emit_size);
+        let mut total_bytes = 0usize;
+        for (mut group_coords, has_input) in emitted_coords.zip(emitted_has_input) {
             if has_input {
-                check_dimension(dimension)?;
-                write_hull(&mut group_coords, &mut hull_builder)?;
-                hull_builder.append_value([]);
+                let vertices = compute_hull_vertices(&mut group_coords);
+                total_bytes += hull_wkb_size(&vertices);
+                hulls.push(Some(vertices));
             } else {
-                hull_builder.append_null();
+                hulls.push(None);
             }
-            dimension_builder.append_option(dimension);
         }
 
-        Ok((
-            Arc::new(hull_builder.finish()),
-            Arc::new(dimension_builder.finish()),
-        ))
+        let mut hull_builder = BinaryBuilder::with_capacity(emit_size, total_bytes);
+        for hull in hulls {
+            match hull {
+                Some(vertices) => {
+                    write_hull_vertices(&vertices, &mut hull_builder)?;
+                    hull_builder.append_value([]);
+                }
+                None => hull_builder.append_null(),
+            }
+        }
+
+        Ok(Arc::new(hull_builder.finish()))
     }
 
     fn merge_state(
@@ -374,13 +340,11 @@ impl ConvexHullGroupsAccumulator {
         opt_filter: Option<&BooleanArray>,
         total_num_groups: usize,
     ) -> Result<()> {
-        debug_assert_eq!(values.len(), 2);
+        debug_assert_eq!(values.len(), 1);
 
         self.coords.resize_with(total_num_groups, Default::default);
         self.has_input.resize(total_num_groups, false);
-        self.dimensions.resize(total_num_groups, None);
 
-        let dimensions = as_int32_array(&values[1])?;
         for (i, &group_id) in group_indices.iter().enumerate() {
             if !filter_keep(opt_filter, i) {
                 continue;
@@ -388,10 +352,6 @@ impl ConvexHullGroupsAccumulator {
 
             self.has_input[group_id] |=
                 push_state_coords(&values[0], i, &mut self.coords[group_id])?;
-            merge_dimension(
-                &mut self.dimensions[group_id],
-                (!dimensions.is_null(i)).then(|| dimensions.value(i)),
-            );
         }
 
         Ok(())
@@ -410,8 +370,7 @@ impl GroupsAccumulator for ConvexHullGroupsAccumulator {
     }
 
     fn state(&mut self, emit_to: EmitTo) -> Result<Vec<ArrayRef>> {
-        let (hull, dimension) = self.emit_wkb_result(emit_to)?;
-        Ok(vec![hull, dimension])
+        Ok(vec![self.emit_wkb_result(emit_to)?])
     }
 
     fn merge_batch(
@@ -425,7 +384,7 @@ impl GroupsAccumulator for ConvexHullGroupsAccumulator {
     }
 
     fn evaluate(&mut self, emit_to: EmitTo) -> Result<ArrayRef> {
-        Ok(self.emit_wkb_result(emit_to)?.0)
+        self.emit_wkb_result(emit_to)
     }
 
     fn size(&self) -> usize {
@@ -652,17 +611,16 @@ mod tests {
     }
 
     #[rstest]
-    fn convex_hull_mixed_dimensions_errors(
+    fn convex_hull_mixed_dimensions_drops_z(
         #[values(WKB_GEOMETRY, WKB_VIEW_GEOMETRY)] sedona_type: SedonaType,
     ) {
         let udf = create_udf();
         let tester = AggregateUdfTester::new(udf.into(), vec![sedona_type.clone()]);
 
         let batches = vec![vec![Some("POINT (0 0)"), Some("POINT Z (1 1 5)")]];
-        let err = tester.aggregate_wkt(batches).unwrap_err();
-        assert_eq!(
-            err.message(),
-            "Can't ST_ConvexHull_Agg() mixed dimension geometries"
+        assert_scalar_equal_wkb_geometry(
+            &tester.aggregate_wkt(batches).unwrap(),
+            Some("LINESTRING (0 0, 1 1)"),
         );
     }
 
@@ -729,7 +687,7 @@ mod tests {
     }
 
     #[rstest]
-    fn udf_grouped_mixed_dimensions_errors(
+    fn udf_grouped_mixed_dimensions_drops_z(
         #[values(WKB_GEOMETRY, WKB_VIEW_GEOMETRY)] sedona_type: SedonaType,
     ) {
         let udf = create_udf();
@@ -746,13 +704,14 @@ mod tests {
         );
         let batches = vec![array0];
 
-        let err = tester
+        let result = tester
             .aggregate_groups(&batches, group_indices, None, vec![])
-            .unwrap_err();
-        assert_eq!(
-            err.message(),
-            "Can't ST_ConvexHull_Agg() mixed dimension geometries"
+            .unwrap();
+        let expected = create_array(
+            &[Some("LINESTRING (0 0, 1 1)"), Some("POINT (5 5)")],
+            &WKB_GEOMETRY,
         );
+        assert_array_equal(&result, &expected);
     }
 
     #[test]
@@ -816,5 +775,24 @@ mod tests {
 
         let ordering = coord_cmp(&Coord { x: 1.0, y: -0.0 }, &Coord { x: 1.0, y: 0.0 });
         assert_eq!(ordering, std::cmp::Ordering::Equal);
+    }
+
+    #[test]
+    fn hull_wkb_size_matches_actual_bytes_written() {
+        let empty: Vec<Coord> = vec![];
+        let point = vec![Coord { x: 1.0, y: 2.0 }];
+        let line = vec![Coord { x: 1.0, y: 2.0 }, Coord { x: 3.0, y: 4.0 }];
+        let polygon = vec![
+            Coord { x: 0.0, y: 0.0 },
+            Coord { x: 1.0, y: 0.0 },
+            Coord { x: 1.0, y: 1.0 },
+            Coord { x: 0.0, y: 0.0 },
+        ];
+
+        for vertices in [empty, point, line, polygon] {
+            let mut buf = Vec::new();
+            write_hull_vertices(&vertices, &mut buf).unwrap();
+            assert_eq!(hull_wkb_size(&vertices), buf.len());
+        }
     }
 }
