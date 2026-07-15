@@ -80,7 +80,7 @@ impl SedonaAccumulator for STConvexHullAgg {
 }
 
 fn push_hull_coords(geom: impl GeometryTrait<T = f64>, out: &mut Vec<Coord>) -> Result<()> {
-    visit_xy_coords(geom, false, &mut |x, y| out.push((x, y).into()))
+    visit_xy_coords(&geom, false, &mut |x, y| out.push((x, y).into()))
         .map_err(|e| DataFusionError::Execution(format!("ST_ConvexHull_Agg(): {e}")))
 }
 
@@ -206,7 +206,7 @@ impl Accumulator for ConvexHullAccumulator {
         executor.execute_wkb_void(|maybe_item| {
             if let Some(item) = maybe_item {
                 self.has_input = true;
-                push_hull_coords(&item, &mut self.coords)?;
+                push_hull_coords(item, &mut self.coords)?;
             }
             Ok(())
         })?;
@@ -287,7 +287,7 @@ impl ConvexHullGroupsAccumulator {
             if keep {
                 if let Some(item) = maybe_item {
                     self.has_input[group_id] = true;
-                    push_hull_coords(&item, &mut self.coords[group_id])?;
+                    push_hull_coords(item, &mut self.coords[group_id])?;
                 }
             }
 
